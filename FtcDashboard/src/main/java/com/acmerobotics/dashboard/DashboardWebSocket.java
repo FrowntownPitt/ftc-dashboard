@@ -80,4 +80,7 @@ public class DashboardWebSocket extends NanoWSD.WebSocket {
         }
     }
 
+    public String getIpAddr() {
+        return getHandshakeRequest().getRemoteIpAddress();
+    }
 }

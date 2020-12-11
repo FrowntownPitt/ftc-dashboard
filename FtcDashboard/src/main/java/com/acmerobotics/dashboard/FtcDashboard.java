@@ -35,9 +35,13 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonSyntaxException;
 import com.qualcomm.ftccommon.FtcEventLoop;
+import com.qualcomm.ftccommon.FtcRobotControllerService;
+import com.qualcomm.robotcore.eventloop.EventLoopManager;
 import com.qualcomm.robotcore.eventloop.opmode.OpMode;
 import com.qualcomm.robotcore.exception.RobotCoreException;
 import com.qualcomm.robotcore.hardware.Gamepad;
+import com.qualcomm.robotcore.robocol.Heartbeat;
+import com.qualcomm.robotcore.robocol.RobocolDatagram;
 import com.qualcomm.robotcore.util.ThreadPool;
 import com.qualcomm.robotcore.util.WebHandlerManager;
 import com.qualcomm.robotcore.util.WebServer;
@@ -56,12 +60,15 @@ import org.firstinspires.ftc.robotserver.internal.webserver.MimeTypesUtil;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.TimeZone;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 
@@ -131,6 +138,16 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
     }
 
     /**
+     * Attaches the controller service to the instance to fetch robot controller internals
+     * @param controllerService event loop manager
+     */
+    public static void attachControllerService(FtcRobotControllerService controllerService) {
+        if (instance != null) {
+            instance.internalAttachControllerService(controllerService);
+        }
+    }
+
+    /**
      * Populates the menu with dashboard enable/disable options.
      * @param menu menu
      */
@@ -176,6 +193,7 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
     private volatile List<TelemetryPacket> pendingTelemetry = new ArrayList<>();
     private final Object telemetryLock = new Object();
     private int telemetryTransmissionInterval = DEFAULT_TELEMETRY_TRANSMISSION_INTERVAL;
+    private final int eventLoopManagerBindIntervalMs = 500;
 
     private CustomVariable configRoot;
     private final List<String[]> varsToRemove = new ArrayList<>();
@@ -185,6 +203,8 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
     private int imageQuality = DEFAULT_IMAGE_QUALITY;
 
     private FtcEventLoop eventLoop;
+    private EventLoopManager eventLoopManager;
+    private FtcRobotControllerService controllerService;
     private OpModeManagerImpl opModeManager;
     private OpMode activeOpMode;
     private RobotStatus.OpModeStatus activeOpModeStatus = RobotStatus.OpModeStatus.STOPPED;
@@ -241,6 +261,31 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
                     }
                 }
             }
+        }
+    }
+
+    private class EventLoopManagerBindRunnable implements Runnable {
+        @Override
+        public void run() {
+            while (eventLoopManager == null) {
+                long startTime = System.currentTimeMillis();
+
+                if (controllerService.getRobot() != null){
+                    eventLoopManager = controllerService.getRobot().eventLoopManager;
+                }
+
+                long elapsedTime = System.currentTimeMillis() - startTime;
+                long sleepTime = eventLoopManagerBindIntervalMs - elapsedTime;
+                if (sleepTime > 0) {
+                    try {
+                        Thread.sleep(sleepTime);
+                    } catch (InterruptedException e) {
+                        break;
+                    }
+                }
+            }
+
+            eventLoopManager = controllerService.getRobot().eventLoopManager;
         }
     }
 
@@ -566,6 +611,13 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
         t.start();
     }
 
+    private void internalAttachControllerService(FtcRobotControllerService controllerService) {
+        this.controllerService = controllerService;
+
+        // The EventLoopManager may not be created yet, so we need to spawn a thread to establish the reference to this.eventLoopManager
+        new EventLoopManagerBindRunnable().run();
+    }
+
     private void internalPopulateMenu(Menu menu) {
         final MenuItem enable = menu.add(Menu.NONE, Menu.NONE, 700, "Enable Dashboard");
         MenuItem disable = menu.add(Menu.NONE, Menu.NONE, 700, "Disable Dashboard");
@@ -856,6 +908,7 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
     void onMessage(DashboardWebSocket socket, Message msg) {
         switch (msg.getType()) {
             case GET_ROBOT_STATUS: {
+                simluateHeartbeat();
                 socket.send(new ReceiveRobotStatus(getRobotStatus()));
                 break;
             }
@@ -890,6 +943,27 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
                 Log.w(TAG, "Received unknown message of type " + msg.getType());
                 Log.w(TAG, msg.toString());
                 break;
+        }
+    }
+
+    private void simluateHeartbeat() {
+        Heartbeat heartbeat = Heartbeat.createWithTimeStamp();
+
+        heartbeat.setTimeZoneId(TimeZone.getDefault().getID());
+        heartbeat.t0 = AppUtil.getInstance().getWallClockTime();
+
+        if(sockets.size() > 0) {
+            try {
+                DashboardWebSocket someSocket = sockets.get(0);
+                RobocolDatagram datagram = new RobocolDatagram(heartbeat, InetAddress.getByName(someSocket.getIpAddr()));
+                if (eventLoopManager != null) {
+                    eventLoopManager.heartbeatEvent(datagram, System.currentTimeMillis());
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "RobocolInterop - Unknown error while simulating heartbeat" + e.getMessage());
+            }
+        } else {
+            Log.w(TAG, "RobotcolInterop - No sockets available to simulate heartbeat");
         }
     }
 
