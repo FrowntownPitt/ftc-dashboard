@@ -37,11 +37,15 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.JsonSyntaxException;
 import com.qualcomm.ftccommon.FtcEventLoop;
 import com.qualcomm.robotcore.eventloop.opmode.LinearOpMode;
+import com.qualcomm.ftccommon.FtcRobotControllerService;
+import com.qualcomm.robotcore.eventloop.EventLoopManager;
 import com.qualcomm.robotcore.eventloop.opmode.OpMode;
 import com.qualcomm.robotcore.eventloop.opmode.OpModeManager;
 import com.qualcomm.robotcore.eventloop.opmode.OpModeRegistrar;
 import com.qualcomm.robotcore.exception.RobotCoreException;
 import com.qualcomm.robotcore.hardware.Gamepad;
+import com.qualcomm.robotcore.robocol.Heartbeat;
+import com.qualcomm.robotcore.robocol.RobocolDatagram;
 import com.qualcomm.robotcore.util.ThreadPool;
 import com.qualcomm.robotcore.util.WebHandlerManager;
 import com.qualcomm.robotcore.util.WebServer;
@@ -64,12 +68,15 @@ import org.firstinspires.ftc.robotserver.internal.webserver.MimeTypesUtil;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.TimeZone;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 
@@ -131,6 +138,7 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
 
     /**
      * Attaches a web server for accessing the dashboard through the phone (like OBJ/Blocks).
+     *
      * @param webServer web server
      */
     public static void attachWebServer(WebServer webServer) {
@@ -141,6 +149,7 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
 
     /**
      * Attaches the event loop to the instance for op mode management.
+     *
      * @param eventLoop event loop
      */
     public static void attachEventLoop(FtcEventLoop eventLoop) {
@@ -150,7 +159,19 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
     }
 
     /**
+     * Attaches the controller service to the instance to fetch robot controller internals
+     *
+     * @param controllerService event loop manager
+     */
+    public static void attachControllerService(FtcRobotControllerService controllerService) {
+        if (instance != null) {
+            instance.internalAttachControllerService(controllerService);
+        }
+    }
+
+    /**
      * Populates the menu with dashboard enable/disable options.
+     *
      * @param menu menu
      */
     public static void populateMenu(Menu menu) {
@@ -176,6 +197,7 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
 
     /**
      * Returns the active instance instance. This should be called after {@link #start()}.
+     *
      * @return active instance instance or null outside of its lifecycle
      */
     public static FtcDashboard getInstance() {
@@ -195,6 +217,7 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
     private volatile List<TelemetryPacket> pendingTelemetry = new ArrayList<>();
     private final Object telemetryLock = new Object();
     private int telemetryTransmissionInterval = DEFAULT_TELEMETRY_TRANSMISSION_INTERVAL;
+    private final int eventLoopManagerBindIntervalMs = 500;
 
     private CustomVariable configRoot;
     private final List<String[]> varsToRemove = new ArrayList<>();
@@ -204,6 +227,8 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
     private int imageQuality = DEFAULT_IMAGE_QUALITY;
 
     private FtcEventLoop eventLoop;
+    private EventLoopManager eventLoopManager;
+    private FtcRobotControllerService controllerService;
     private OpModeManagerImpl opModeManager;
     private OpMode activeOpMode;
     private RobotStatus.OpModeStatus activeOpModeStatus = RobotStatus.OpModeStatus.STOPPED;
@@ -262,6 +287,31 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
                     }
                 }
             }
+        }
+    }
+
+    private class EventLoopManagerBindRunnable implements Runnable {
+        @Override
+        public void run() {
+            while (eventLoopManager == null) {
+                long startTime = System.currentTimeMillis();
+
+                if (controllerService.getRobot() != null) {
+                    eventLoopManager = controllerService.getRobot().eventLoopManager;
+                }
+
+                long elapsedTime = System.currentTimeMillis() - startTime;
+                long sleepTime = eventLoopManagerBindIntervalMs - elapsedTime;
+                if (sleepTime > 0) {
+                    try {
+                        Thread.sleep(sleepTime);
+                    } catch (InterruptedException e) {
+                        break;
+                    }
+                }
+            }
+
+            eventLoopManager = controllerService.getRobot().eventLoopManager;
         }
     }
 
@@ -386,8 +436,8 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
 
     private void setAutoEnable(boolean autoEnable) {
         prefs.edit()
-             .putBoolean(PREFS_AUTO_ENABLE_KEY, autoEnable)
-             .apply();
+                .putBoolean(PREFS_AUTO_ENABLE_KEY, autoEnable)
+                .apply();
     }
 
     private void enable() {
@@ -593,6 +643,13 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
         t.start();
     }
 
+    private void internalAttachControllerService(FtcRobotControllerService controllerService) {
+        this.controllerService = controllerService;
+
+        // The EventLoopManager may not be created yet, so we need to spawn a thread to establish the reference to this.eventLoopManager
+        new EventLoopManagerBindRunnable().run();
+    }
+
     private void internalPopulateMenu(Menu menu) {
         MenuItem enable = menu.add(Menu.NONE, Menu.NONE, 700, "Enable Dashboard");
         MenuItem disable = menu.add(Menu.NONE, Menu.NONE, 700, "Disable Dashboard");
@@ -654,10 +711,10 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
     private void internalRegisterOpMode(OpModeManager manager) {
         manager.register(
                 new OpModeMeta.Builder()
-                    .setName("Dashboard Enable/Disable")
-                    .setFlavor(OpModeMeta.Flavor.TELEOP)
-                    .setGroup("dash")
-                    .build(),
+                        .setName("Dashboard Enable/Disable")
+                        .setFlavor(OpModeMeta.Flavor.TELEOP)
+                        .setGroup("dash")
+                        .build(),
                 new LinearOpMode() {
                     @Override
                     public void runOpMode() throws InterruptedException {
@@ -692,6 +749,7 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
 
     /**
      * Sends telemetry information to all instance clients.
+     *
      * @param telemetryPacket packet to send
      */
     public void sendTelemetryPacket(TelemetryPacket telemetryPacket) {
@@ -724,6 +782,7 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
 
     /**
      * Sets the telemetry transmission interval.
+     *
      * @param newTransmissionInterval transmission interval in milliseconds
      */
     public void setTelemetryTransmissionInterval(int newTransmissionInterval) {
@@ -746,10 +805,11 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
 
     /**
      * Add config variable with custom provider that is automatically removed when op mode ends.
+     *
      * @param category top-level category
-     * @param name variable name
+     * @param name     variable name
      * @param provider getter/setter for the variable
-     * @param <T> variable type
+     * @param <T>      variable type
      */
     public <T> void addConfigVariable(String category, String name, ValueProvider<T> provider) {
         addConfigVariable(category, name, provider, true);
@@ -757,11 +817,12 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
 
     /**
      * Add config variable with custom provider.
-     * @param category top-level category
-     * @param name variable name
-     * @param provider getter/setter for the variable
+     *
+     * @param category   top-level category
+     * @param name       variable name
+     * @param provider   getter/setter for the variable
      * @param autoRemove if true, the variable is removed on op mode termination
-     * @param <T> variable type
+     * @param <T>        variable type
      */
     public <T> void addConfigVariable(String category, String name, ValueProvider<T> provider,
                                       boolean autoRemove) {
@@ -775,7 +836,7 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
         }
         if (autoRemove) {
             synchronized (configLock) {
-                varsToRemove.add(new String[] { category, name });
+                varsToRemove.add(new String[]{category, name});
             }
         }
         updateConfig();
@@ -783,8 +844,9 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
 
     /**
      * Remove a config variable.
+     *
      * @param category top-level category
-     * @param name variable name
+     * @param name     variable name
      */
     public void removeConfigVariable(String category, String name) {
         CustomVariable catVar = (CustomVariable) configRoot.getVariable(category);
@@ -798,6 +860,7 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
     /**
      * Sends an image to the dashboard for display (MJPEG style). Note that the encoding process is
      * synchronous. Stops the active stream if running.
+     *
      * @param bitmap bitmap to send
      */
     public void sendImage(Bitmap bitmap) {
@@ -810,6 +873,7 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
 
     /**
      * Sends a stream of camera frames at a regular interval.
+     *
      * @param source camera stream source
      * @param maxFps maximum frames per second; 0 indicates unlimited
      */
@@ -910,6 +974,7 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
     void onMessage(DashboardWebSocket socket, Message msg) {
         switch (msg.getType()) {
             case GET_ROBOT_STATUS: {
+                simluateHeartbeat();
                 socket.send(new ReceiveRobotStatus(getRobotStatus()));
                 break;
             }
@@ -944,6 +1009,27 @@ public class FtcDashboard implements OpModeManagerImpl.Notifications {
                 Log.w(TAG, "Received unknown message of type " + msg.getType());
                 Log.w(TAG, msg.toString());
                 break;
+        }
+    }
+
+    private void simluateHeartbeat() {
+        Heartbeat heartbeat = Heartbeat.createWithTimeStamp();
+
+        heartbeat.setTimeZoneId(TimeZone.getDefault().getID());
+        heartbeat.t0 = AppUtil.getInstance().getWallClockTime();
+
+        if (sockets.size() > 0) {
+            try {
+                DashboardWebSocket someSocket = sockets.get(0);
+                RobocolDatagram datagram = new RobocolDatagram(heartbeat, InetAddress.getByName(someSocket.getIpAddr()));
+                if (eventLoopManager != null) {
+                    eventLoopManager.heartbeatEvent(datagram, System.currentTimeMillis());
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "RobocolInterop - Unknown error while simulating heartbeat" + e.getMessage());
+            }
+        } else {
+            Log.w(TAG, "RobotcolInterop - No sockets available to simulate heartbeat");
         }
     }
 
